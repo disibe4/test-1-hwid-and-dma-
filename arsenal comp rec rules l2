@@ -1,0 +1,184 @@
+#Requires -RunAsAdministrator
+[CmdletBinding()]
+param()
+
+if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`"" -Verb RunAs
+    exit
+}
+
+Write-Host "fuck cheaters and detect them" -ForegroundColor Red
+
+$global:WebhookUrl = "https://discord.com/api/webhooks/1569409898964451328/tMasUoOzW1cxjf09ihaFVajgWLSGxaFjsaanDswI5SlR1EQ47clPXM4jTnT-fg68-ibY"
+$global:Findings = [System.Collections.ArrayList]::new()
+
+$global:TargetSignatures = '(?i)^(synapse|synapse\s*z|krnl|fluxus|solara|jjsploit|scriptware|cheatengine|x64dbg|x32dbg|kdmapper|xenos|wave|delta|codex|comet|celery|electron|hydrogen|evon|oxygen|arceus|xeno|zorara|velocity|seliware|volcano|cryptic|nezur|potassium|swift|awp|matcha|rc7|sirhurt|macsploit|omega|zenith|oxygenu|volt|lucid|lynx|real|madium|isaeva|athena|serotonin|severe|lumen|matrix\s*hub|madius|axis|photon|dx9ware|dx9ware\s*v2|installer|injector|loader|spoofer|reclass|dnspy|colorbot)$'
+$global:CheatKeywords = '(?i)(volt|potassium|wave|synapse\s*z|lucid|lynx|real|madium|isaeva|volcano|athena|velocity|sirhurt|solara|xeno|installer|serotonin|matcha|severe|lumen|matrix\s*hub|madius|axis|photon|dx9ware|dx9ware\s*v2|colorbot|cheat|exploit|injector)'
+
+function Test-TrustedPath {
+    param([string]$Path)
+    if (-not $Path) { return $false }
+    $lower = $Path.ToLower()
+    if ($lower -match '^[a-z]:\\windows\\system32\\' -or $lower -match '^[a-z]:\\windows\\syswow64\\' -or $lower -match '^[a-z]:\\program files\\') {
+        if ($lower -match 'snippingtool|screensketch|explorer\.exe|dwm\.exe|svchost\.exe|csrss\.exe|lsass\.exe') {
+            return $true
+        }
+        return $true
+    }
+    return $false
+}
+
+function Add-Finding {
+    param([string]$Category, [string]$Details, [string]$PathInfo)
+    [void]$global:Findings.Add([PSCustomObject]@{ Category = $Category; Details = $Details; Path = $PathInfo })
+}
+
+$global:NativeOk = $false
+try {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+public static class RecNative {
+    [DllImport("kernel32.dll", SetLastError=true)]
+    public static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    public static extern bool CloseHandle(IntPtr h);
+    [DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
+    public static extern bool QueryFullProcessImageName(IntPtr h, uint flags, StringBuilder sb, ref uint size);
+    public static string ImagePath(int pid) {
+        IntPtr h = OpenProcess(0x1000, false, pid);
+        if (h == IntPtr.Zero) return null;
+        try {
+            StringBuilder sb = new StringBuilder(2048);
+            uint size = 2048;
+            if (QueryFullProcessImageName(h, 0, sb, ref size)) return sb.ToString();
+            return null;
+        } finally { CloseHandle(h); }
+    }
+}
+'@ -ErrorAction Stop
+    $global:NativeOk = $true
+} catch {}
+
+function Get-SecureImagePath {
+    param([int]$ProcessId)
+    if (-not $global:NativeOk -or $ProcessId -le 0) { return $null }
+    try { return [RecNative]::ImagePath($ProcessId) } catch { return $null }
+}
+
+function Run-Scans {
+    try {
+        foreach ($proc in (Get-Process -ErrorAction SilentlyContinue)) {
+            $path = Get-SecureImagePath -ProcessId $proc.Id
+            if (Test-TrustedPath -Path $path) { continue }
+            if ($proc.Name -match $global:TargetSignatures) {
+                Add-Finding "Process" "$($proc.Name)" "$path"
+            }
+        }
+
+        foreach ($py in (Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '(?i)^(python|pythonw|py)$' })) {
+            $path = Get-SecureImagePath -ProcessId $py.Id
+            $cmdLine = (Get-CimInstance Win32_Process -Filter "ProcessId = $($py.Id)" -ErrorAction SilentlyContinue).CommandLine
+            if ($cmdLine -and $cmdLine -match $global:CheatKeywords) {
+                Add-Finding "Colorbot/Script" "Python Script Execution" "$path"
+            }
+        }
+
+        foreach ($user in (Get-ChildItem -Path "$env:SystemDrive\Users" -Directory -ErrorAction SilentlyContinue)) {
+            $paths = @(
+                "$($user.FullName)\AppData\Local\Google\Chrome\User Data\Default\History",
+                "$($user.FullName)\AppData\Local\Microsoft\Edge\User Data\Default\History",
+                "$($user.FullName)\AppData\Local\BraveSoftware\Brave-Browser\User Data\Default\History"
+            )
+            foreach ($histPath in $paths) {
+                if (Test-Path $histPath) {
+                    try {
+                        $tempCopy = "$env:TEMP\h_$(Get-Random).db"
+                        Copy-Item -LiteralPath $histPath -Destination $tempCopy -Force -ErrorAction SilentlyContinue
+                        if (Test-Path $tempCopy) {
+                            $text = [System.Text.Encoding]::UTF8.GetString([System.IO.File]::ReadAllBytes($tempCopy))
+                            Remove-Item -LiteralPath $tempCopy -Force -ErrorAction SilentlyContinue
+                            if ($text -match $global:CheatKeywords) {
+                                Add-Finding "Browser Forensics" "Cheat History Match Found" "$histPath"
+                            }
+                        }
+                    } catch {}
+                }
+            }
+        }
+
+        $sac = (Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\SmartAppControl" -Name "Enabled" -ErrorAction SilentlyContinue).Enabled
+        if ($null -eq $sac -or $sac -eq 0) {
+            Add-Finding "Security" "Smart App Control Disabled/Inactive" "HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\SmartAppControl"
+        }
+
+        $pref = Get-MpPreference -ErrorAction SilentlyContinue
+        if ($pref) {
+            if ($pref.DisableRealtimeMonitoring -eq $true) { Add-Finding "Defender" "Real-time protection disabled" "Windows Defender Preferences" }
+            if ($pref.DisableBehaviorMonitoring -eq $true) { Add-Finding "Defender" "Behavior monitoring disabled" "Windows Defender Preferences" }
+            if ($pref.ExclusionPath -and $pref.ExclusionPath.Count -gt 0) { Add-Finding "Defender" "Path exclusions active" "Windows Defender Preferences" }
+        }
+
+        $prefetchDir = "$env:SystemRoot\Prefetch"
+        if (Test-Path $prefetchDir) {
+            foreach ($pf in (Get-ChildItem -Path $prefetchDir -Filter "*.pf" -ErrorAction SilentlyContinue)) {
+                if ($pf.Name.ToLower() -match $global:TargetSignatures -or $pf.Name.ToLower() -match $global:CheatKeywords) {
+                    Add-Finding "Prefetch" "$($pf.Name)" "$prefetchDir\$($pf.Name)"
+                }
+            }
+        }
+
+        foreach ($drv in (Get-CimInstance Win32_SystemDriver -ErrorAction SilentlyContinue | Where-Object { $_.State -eq 'Running' })) {
+            if ($drv.PathName) {
+                $cleanPath = $drv.PathName -replace '^\??\\', ''
+                if ($cleanPath -match '^system32\\drivers\\') { $cleanPath = "$env:SystemRoot\$cleanPath" }
+                if ($cleanPath -match $global:TargetSignatures -or (-not (Test-Path -LiteralPath $cleanPath) -and $drv.Name -match $global:CheatKeywords)) {
+                    Add-Finding "Kernel Driver" "$($drv.Name)" "$cleanPath"
+                }
+            }
+        }
+
+        foreach ($dev in (Get-PnpDevice -ErrorAction SilentlyContinue)) {
+            $hwId = "$($dev.HardwareID)"
+            $name = "$($dev.Name)"
+            if ($hwId -match 'VEN_10EE' -or $hwId -match 'VEN_1172' -or $name -match '(?i)(fpga|xilinx|screamer|leetdma|squirrel|dma)') {
+                Add-Finding "Hardware" "Suspicious DMA/FPGA: $name" "Device Manager PnP"
+            }
+        }
+
+        foreach ($bb in (Get-CimInstance Win32_BaseBoard -ErrorAction SilentlyContinue)) {
+            $sn = "$($bb.SerialNumber)".Trim()
+            if ($sn -match '(?i)^(to be filled|default|oem|none|0+|-|system serial|unknown|1234567890)$' -or $sn.Length -lt 3) {
+                Add-Finding "HWID Spoofer" "Motherboard serial spoofed/blank" "Win32_BaseBoard"
+            }
+        }
+    } catch {}
+}
+
+Run-Scans
+
+if ($global:WebhookUrl) {
+    try {
+        $desc = if ($global:Findings.Count -eq 0) { "No cheats, unauthorized tools, or tampering detected." } else {
+            ($global:Findings | ForEach-Object { "**[$($_.Category)]** $($_.Details)`n`*Path:* ``$($_.Path)``" }) -join "`n`n"
+        }
+        if ($desc.Length -gt 4000) { $desc = $desc.Substring(0, 3996) + "..." }
+
+        $payload = @{
+            username = "Roblox Anti-Cheat Sentinel"
+            embeds = @(
+                @{
+                    title       = "Diagnostic & Cheat Detection Report"
+                    description = $desc
+                    color       = if ($global:Findings.Count -gt 0) { 15158332 } else { 3066993 }
+                    timestamp   = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ssZ")
+                }
+            )
+        } | ConvertTo-Json -Depth 10
+
+        Invoke-RestMethod -Uri $global:WebhookUrl -Method Post -Body $payload -ContentType 'application/json' -ErrorAction SilentlyContinue
+    } catch {}
+}
+
+Write-Host "hope lil bro got detected" -ForegroundColor white
