@@ -1,184 +1,612 @@
-#Requires -RunAsAdministrator
-[CmdletBinding()]
-param()
+<#
+    COMPETITIVE ANTI-EXPLOIT / CHEAT DETECTOR  v3.0
+    Single-file, self-elevating Roblox / competitive screenshare scanner.
+    Tier 1 = Standard | Tier 2 = Deep | Tier 3 = Full Forensic
+    Results are posted to a Discord webhook as modern embeds.
 
-if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`"" -Verb RunAs
+    NOTE: Only run this on a machine whose owner has agreed to be scanned.
+#>
+
+# =====================================================================
+#  CONFIG
+# =====================================================================
+$WebhookUrl  = 'https://discord.com/api/webhooks/1569409898964451328/tMasUoOzW1cxjf09ihaFVajgWLSGxaFjsaanDswI5SlR1EQ47clPXM4jTnT-fg68-ibY'
+$ProfileBase = 'https://discord.com/users/'     # working profile link base (discord.gg/users/ does not resolve)
+$UserAgent   = 'CompetitiveAntiExploit/3.0 (PowerShell; Windows)'
+$ToolName    = 'Competitive Anti-Exploit'
+
+# =====================================================================
+#  SELF-ELEVATE
+# =====================================================================
+$principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    $self = $MyInvocation.MyCommand.Path
+    if ($self) {
+        Start-Process powershell.exe -Verb RunAs -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$self`""
+    } else {
+        Write-Host 'Please run this script from an elevated (Administrator) PowerShell window.' -ForegroundColor Red
+        Read-Host 'Press ENTER to exit' | Out-Null
+    }
     exit
 }
 
-Write-Host "fuck cheaters and detect them" -ForegroundColor Red
+$ErrorActionPreference = 'SilentlyContinue'
+$ProgressPreference    = 'SilentlyContinue'
+try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
+try { $Host.UI.RawUI.WindowTitle = 'COMPETITIVE ANTI-EXPLOIT / CHEAT DETECTOR' } catch {}
 
-$global:WebhookUrl = "https://discord.com/api/webhooks/1569409898964451328/tMasUoOzW1cxjf09ihaFVajgWLSGxaFjsaanDswI5SlR1EQ47clPXM4jTnT-fg68-ibY"
-$global:Findings = [System.Collections.ArrayList]::new()
+# =====================================================================
+#  STATE + SIGNATURES
+# =====================================================================
+$Script:Findings = New-Object 'System.Collections.Generic.List[object]'
+$Script:Seen     = New-Object 'System.Collections.Generic.HashSet[string]'
+$Script:Passed   = New-Object 'System.Collections.Generic.List[string]'
+$Script:DiscordAccounts = @()
+$Script:WinAccounts     = @()
+$SigCache = @{}
 
-$global:TargetSignatures = '(?i)^(synapse|synapse\s*z|krnl|fluxus|solara|jjsploit|scriptware|cheatengine|x64dbg|x32dbg|kdmapper|xenos|wave|delta|codex|comet|celery|electron|hydrogen|evon|oxygen|arceus|xeno|zorara|velocity|seliware|volcano|cryptic|nezur|potassium|swift|awp|matcha|rc7|sirhurt|macsploit|omega|zenith|oxygenu|volt|lucid|lynx|real|madium|isaeva|athena|serotonin|severe|lumen|matrix\s*hub|madius|axis|photon|dx9ware|dx9ware\s*v2|installer|injector|loader|spoofer|reclass|dnspy|colorbot)$'
-$global:CheatKeywords = '(?i)(volt|potassium|wave|synapse\s*z|lucid|lynx|real|madium|isaeva|volcano|athena|velocity|sirhurt|solara|xeno|installer|serotonin|matcha|severe|lumen|matrix\s*hub|madius|axis|photon|dx9ware|dx9ware\s*v2|colorbot|cheat|exploit|injector)'
+$StrongList = @(
+ 'synapse[ _\-]?(x|z)','synapse(x|z)','\bkrnl','fluxus','solara','script[ _\-]?ware','jjsploit','sirhurt',
+ 'protosmasher','wearedevs','wrd[ _\-]?api','macsploit','ronix[ _\-]?(exec|ui|loader)?','seliware',
+ 'evon[ _\-]?(executor|ui|exec)','hydrogen[ _\-]?(executor|ui|x)','arceus[ _\-]?x','codex[ _\-]?(executor|ui|loader)',
+ 'xeno[ _\-]?(executor|ui|loader|bootstrapper)','wave[ _\-]?(executor|loader|bootstrapper|ui)',
+ 'delta[ _\-]?(executor|exec|loader)','oxygen[ _\-]?(u|executor|loader)','velocity[ _\-]?(executor|ui)',
+ 'volcano[ _\-]?(executor|ui)','potassium[ _\-]?(executor|ui)','nihon[ _\-]?(executor|ui)',
+ 'comet[ _\-]?(executor|ui)','swift[ _\-]?(executor|ui)','valex','cryptic[ _\-]?(executor|ui)','bunni[ _\-]?fun',
+ 'isaeva','roblox[ _\-]?(exploit|hack|cheat|executor|injector)','rbx[ _\-]?(exploit|executor|injector)',
+ 'lua[ _\-]?executor','script[ _\-]?executor','exploit[ _\-]?(executor|loader|injector)','dll[ _\-]?injector',
+ 'extreme[ _\-]?injector','xenos(64|injector)?','\bsploit','aimbot','triggerbot','wall[ _\-]?hack',
+ 'cheat[ _\-]?engine','cheatengine','speed[ _\-]?hack'
+)
+$StrongRx = '(?i)(' + ($StrongList -join '|') + ')'
+$WeakRx   = '(?i)^(wave|delta|xeno|oxygen|volcano|velocity|potassium|nihon|comet|swift|hydrogen|codex|evon|cryptic|bunni|celery|ronix|valyse|seliware)(x|z|64|[ _\-]?\d+)?\.exe$'
+$DmaRx    = '(?i)(xilinx|fpga|screamer|leetdma|squirrel|pcileech|ft601|ft60x|artix|kintex|zynq|ac701|enigma[ _\-]?x1|neutrino|raptor[ _\-]?dma|captain[ _\-]?dma|dma[ _\-]?(card|board|fw)|VEN_10EE|VID_0403&PID_601[EF])'
 
-function Test-TrustedPath {
-    param([string]$Path)
-    if (-not $Path) { return $false }
-    $lower = $Path.ToLower()
-    if ($lower -match '^[a-z]:\\windows\\system32\\' -or $lower -match '^[a-z]:\\windows\\syswow64\\' -or $lower -match '^[a-z]:\\program files\\') {
-        if ($lower -match 'snippingtool|screensketch|explorer\.exe|dwm\.exe|svchost\.exe|csrss\.exe|lsass\.exe') {
-            return $true
+$SysRoots = @($env:SystemRoot, $env:ProgramFiles, ${env:ProgramFiles(x86)}) | Where-Object { $_ }
+$TrustedApps = @('SnippingTool','ScreenClippingHost','ScreenSketch','Snip','SnippingToolPlus')
+
+function Test-SystemPath([string]$p) {
+    if (-not $p) { return $true }
+    if ($p.StartsWith("$env:SystemRoot\Temp\", [StringComparison]::OrdinalIgnoreCase)) { return $false }
+    foreach ($r in $SysRoots) { if ($p.StartsWith($r + '\', [StringComparison]::OrdinalIgnoreCase)) { return $true } }
+    return $false
+}
+function Get-VerInfo([string]$p) { try { [Diagnostics.FileVersionInfo]::GetVersionInfo($p) } catch { $null } }
+function Get-SigStatus([string]$p) {
+    if ($SigCache.ContainsKey($p)) { return $SigCache[$p] }
+    $s = 'Unknown'
+    try { $s = (Get-AuthenticodeSignature -LiteralPath $p -ErrorAction Stop).Status.ToString() } catch {}
+    $SigCache[$p] = $s
+    return $s
+}
+function Add-Finding {
+    param([string]$Category, [string]$Details, [string]$Path = 'N/A', [string]$Severity = 'High')
+    $key = "$Category|$Details|$Path".ToLower()
+    if ($Script:Seen.Add($key)) {
+        $Script:Findings.Add([pscustomobject]@{
+            Category = $Category
+            Details  = ($Details -replace '[\r\n]+', ' ')
+            Path     = ($Path -replace '[\r\n]+', ' ')
+            Severity = $Severity
+        })
+    }
+}
+function Add-Pass([string]$Text) { $Script:Passed.Add($Text) }
+
+# =====================================================================
+#  UI HELPERS
+# =====================================================================
+function Write-Typed([string]$Text, [ConsoleColor]$Color = 'Gray', [int]$Delay = 10, [switch]$NoNewLine) {
+    foreach ($c in $Text.ToCharArray()) { Write-Host $c -NoNewline -ForegroundColor $Color; Start-Sleep -Milliseconds $Delay }
+    if (-not $NoNewLine) { Write-Host '' }
+}
+function Show-DecryptText([string]$Text, [ConsoleColor]$Color = 'Cyan', [int]$Frames = 16) {
+    $rnd = New-Object Random
+    $chars = '#$%&@!?*+=<>/|0123456789ABCDEF'.ToCharArray()
+    for ($f = 0; $f -le $Frames; $f++) {
+        $sb = New-Object Text.StringBuilder
+        foreach ($c in $Text.ToCharArray()) {
+            if ($c -eq ' ' -or $rnd.NextDouble() -lt ($f / $Frames)) { [void]$sb.Append($c) }
+            else { [void]$sb.Append($chars[$rnd.Next($chars.Length)]) }
         }
-        return $true
+        $col = if ($f -eq $Frames) { $Color } else { 'DarkGray' }
+        Write-Host ("`r" + $sb.ToString()) -NoNewline -ForegroundColor $col
+        Start-Sleep -Milliseconds 40
+    }
+    Write-Host ''
+}
+function Show-Banner {
+    Clear-Host
+    $w = 76
+    $edge = '+' + ('=' * ($w - 2)) + '+'
+    $grad = 'DarkRed','Red','Magenta','DarkMagenta','Blue','Cyan'
+    Write-Host ''
+    foreach ($i in 0..5) { Write-Host ('  ' + ('/\' * 38)).Substring(0, $w + 2) -ForegroundColor $grad[$i]; Start-Sleep -Milliseconds 25 }
+    Write-Host "  $edge" -ForegroundColor Cyan
+    $status = '  [ SYSTEM ONLINE ]        [ ACCESS: ELEVATED ]        [ BUILD 3.0 ]  '
+    Write-Host ('  |' + $status.PadRight($w - 2).Substring(0, $w - 2) + '|') -ForegroundColor DarkCyan
+    Write-Host "  $edge" -ForegroundColor Cyan
+    Write-Host ''
+    $title = 'COMPETITIVE ANTI-EXPLOIT / CHEAT DETECTOR'
+    $pad = ' ' * [math]::Max(0, [int](($w - $title.Length) / 2))
+    Show-DecryptText ('  ' + $pad + $title) 'White' 18
+    $sub = 'Roblox  *  Competitive  *  Forensic Screenshare Suite'
+    Write-Host ('  ' + (' ' * [math]::Max(0, [int](($w - $sub.Length) / 2))) + $sub) -ForegroundColor DarkGray
+    Write-Host ''
+    foreach ($i in 5..0) { Write-Host ('  ' + ('\/' * 38)).Substring(0, $w + 2) -ForegroundColor $grad[$i]; Start-Sleep -Milliseconds 25 }
+    Write-Host ''
+}
+function Show-Menu {
+    $line = '  +' + ('-' * 72) + '+'
+    Write-Host $line -ForegroundColor DarkCyan
+    Write-Host '  |  SELECT RECORDING TIER                                                  |' -ForegroundColor White
+    Write-Host $line -ForegroundColor DarkCyan
+    Write-Host '  |  [1]  STANDARD   processes, renamed exes, files, Roblox modules         |' -ForegroundColor Green
+    Write-Host '  |  [2]  DEEP       Tier 1 + Prefetch traces + Defender status/exclusions  |' -ForegroundColor Yellow
+    Write-Host '  |  [3]  FORENSIC   Tier 1-2 + Memory Integrity (VBS) + DMA/FPGA hardware |' -ForegroundColor Red
+    Write-Host $line -ForegroundColor DarkCyan
+    Write-Host ''
+}
+function Read-DiscordId([string]$Prompt) {
+    while ($true) {
+        $v = (Read-Host $Prompt).Trim()
+        if ($v -eq '') { return '' }
+        if ($v -match '^\d{17,20}$') { return $v }
+        Write-Host '    Invalid ID. A Discord ID is 17-20 digits (or press ENTER to skip).' -ForegroundColor DarkYellow
+    }
+}
+function Show-Step([int]$i, [int]$n, [string]$label) {
+    $w = 28; $f = [int]($w * $i / $n)
+    $bar = ('#' * $f) + ('.' * ($w - $f))
+    Write-Host ('  [{0}] {1,3}%  {2}' -f $bar, [int](100 * $i / $n), $label) -ForegroundColor Cyan -NoNewline
+}
+
+# =====================================================================
+#  TIER 1 - PROCESSES / FILES / ROBLOX MODULES
+# =====================================================================
+function Invoke-ProcessScan {
+    $lolbins = '^(powershell|pwsh|cmd|wscript|cscript|mshta|rundll32|regsvr32)\.exe$'
+    foreach ($p in (Get-CimInstance Win32_Process)) {
+        if ($p.ProcessId -in 0, 4, $PID) { continue }
+        $name = [string]$p.Name; $path = [string]$p.ExecutablePath; $cmd = [string]$p.CommandLine
+        if ($TrustedApps -contains ($name -replace '\.exe$', '')) { continue }
+
+        if (Test-SystemPath $path) {
+            if ($name -match $lolbins -and $cmd -match $StrongRx -and $cmd -notmatch 'CompetitiveAntiExploit') {
+                Add-Finding 'Suspicious Command Line' "$name (PID $($p.ProcessId)) command line references an exploit signature" $path 'High'
+            }
+            continue
+        }
+
+        $vi = Get-VerInfo $path
+        $meta = "$($vi.OriginalFilename) $($vi.InternalName) $($vi.ProductName) $($vi.FileDescription) $($vi.CompanyName)"
+        if ($name -match $StrongRx -or $path -match $StrongRx) {
+            Add-Finding 'Cheat Process' "$name (PID $($p.ProcessId)) matches a known exploit/cheat signature" $path 'High'
+        }
+        elseif ($meta -match $StrongRx) {
+            Add-Finding 'Renamed Executable' "$name is disguised - embedded metadata reveals '$($vi.OriginalFilename)' / '$($vi.ProductName)'" $path 'High'
+        }
+        elseif ($name -match $WeakRx -and (Get-SigStatus $path) -ne 'Valid') {
+            Add-Finding 'Suspicious Process' "$name (PID $($p.ProcessId)) is unsigned and uses a known executor name" $path 'Medium'
+        }
+        if ($cmd -match $StrongRx -and $name -notmatch $StrongRx -and $cmd -notmatch 'CompetitiveAntiExploit') {
+            Add-Finding 'Suspicious Command Line' "$name (PID $($p.ProcessId)) launched with exploit-related arguments" $path 'Medium'
+        }
+    }
+}
+
+function Invoke-RobloxModuleScan {
+    $robloxProcs = Get-Process -Name 'RobloxPlayerBeta', 'RobloxStudioBeta', 'RobloxPlayer', 'Windows10Universal' -ErrorAction SilentlyContinue
+    if (-not $robloxProcs) { Add-Pass 'Roblox not running (module injection check skipped)'; return }
+    $bad = 0
+    foreach ($rp in $robloxProcs) {
+        try { $mods = $rp.Modules } catch { continue }
+        foreach ($m in $mods) {
+            $mp = [string]$m.FileName
+            if (-not $mp -or (Test-SystemPath $mp)) { continue }
+            if ($mp -match '\\Roblox\\Versions\\') { continue }
+            if ($mp -match $StrongRx) { Add-Finding 'Injected Module' "$($m.ModuleName) loaded inside $($rp.ProcessName) matches exploit signature" $mp 'High'; $bad++; continue }
+            if ((Get-SigStatus $mp) -ne 'Valid') {
+                Add-Finding 'Unsigned Module in Roblox' "$($m.ModuleName) is unsigned and loaded inside $($rp.ProcessName)" $mp 'Medium'; $bad++
+            }
+        }
+    }
+    if ($bad -eq 0) { Add-Pass 'No injected / unsigned modules inside Roblox' }
+}
+
+function Invoke-DiskScan {
+    $targets = New-Object System.Collections.Generic.List[object]
+    $targets.Add([pscustomobject]@{ P = "$env:SystemDrive\"; D = 1 })
+    $targets.Add([pscustomobject]@{ P = "$env:ProgramData"; D = 2 })
+    foreach ($u in (Get-ChildItem "$env:SystemDrive\Users" -Directory -Force | Where-Object { $_.Name -notin 'Public', 'Default', 'Default User', 'All Users' })) {
+        foreach ($s in @(@('Desktop', 4), @('Downloads', 4), @('Documents', 3), @('AppData\Local\Temp', 3), @('AppData\Roaming', 2), @('AppData\Local', 2))) {
+            $targets.Add([pscustomobject]@{ P = (Join-Path $u.FullName $s[0]); D = $s[1] })
+        }
+    }
+    $noise = '\\(Packages|Microsoft|Google|Mozilla|node_modules|\.git|Programs\\Python|pip|npm-cache)\\'
+    foreach ($t in $targets) {
+        if (-not (Test-Path -LiteralPath $t.P)) { continue }
+        Get-ChildItem -LiteralPath $t.P -Recurse -Depth $t.D -Force -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match $StrongRx -and $_.FullName -notmatch $noise -and $_.Name -notmatch 'CompetitiveAntiExploit' } |
+            ForEach-Object {
+                $kind = if ($_.PSIsContainer) { 'Cheat Folder' } else { 'Cheat File on Disk' }
+                Add-Finding $kind "$($_.Name) matches a known exploit/cheat signature (modified $($_.LastWriteTime.ToString('yyyy-MM-dd HH:mm')))" $_.FullName 'High'
+            }
+    }
+}
+
+# =====================================================================
+#  TIER 2 - PREFETCH / DEFENDER
+# =====================================================================
+function Invoke-PrefetchScan {
+    $reg = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management\PrefetchParameters' -ErrorAction SilentlyContinue).EnablePrefetcher
+    if ($reg -eq 0) {
+        Add-Finding 'Prefetch Disabled' 'Prefetch is turned off - execution traces are not being recorded (possible evidence tampering)' 'HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management\PrefetchParameters' 'Medium'
+    }
+    $files = @(Get-ChildItem "$env:SystemRoot\Prefetch\*.pf" -Force -ErrorAction SilentlyContinue)
+    if ($files.Count -eq 0) {
+        Add-Finding 'Prefetch Empty' 'No Prefetch files present - folder may have been wiped' "$env:SystemRoot\Prefetch" 'Medium'
+        return
+    }
+    $hits = 0
+    foreach ($f in $files) {
+        $exe = $f.Name -replace '-[0-9A-Fa-f]{8}\.pf$', ''
+        if ($exe -match $StrongRx) {
+            Add-Finding 'Prefetch Execution Trace' "$exe was executed (last run $($f.LastWriteTime.ToString('yyyy-MM-dd HH:mm')))" $f.FullName 'High'; $hits++
+        } elseif ($exe -match $WeakRx) {
+            Add-Finding 'Prefetch Execution Trace' "$exe (known executor name) was executed (last run $($f.LastWriteTime.ToString('yyyy-MM-dd HH:mm')))" $f.FullName 'Medium'; $hits++
+        }
+    }
+    if ($hits -eq 0) { Add-Pass "Prefetch clean ($($files.Count) traces reviewed)" }
+}
+
+function Invoke-DefenderScan {
+    try {
+        $st = Get-MpComputerStatus -ErrorAction Stop
+        if ($st.RealTimeProtectionEnabled) { Add-Pass 'Defender real-time protection ON' }
+        else { Add-Finding 'Defender Real-Time OFF' 'Windows Defender real-time protection is DISABLED' 'Windows Security > Virus & threat protection' 'High' }
+        if (-not $st.AntivirusEnabled) { Add-Finding 'Defender Antivirus OFF' 'Windows Defender antivirus engine is disabled' 'Windows Security > Virus & threat protection' 'Medium' }
+        $pref = Get-MpPreference -ErrorAction Stop
+        $ex = 0
+        foreach ($x in @($pref.ExclusionPath))      { if ($x) { Add-Finding 'Defender Path Exclusion' 'Folder/file excluded from Defender scanning' $x 'High'; $ex++ } }
+        foreach ($x in @($pref.ExclusionProcess))   { if ($x) { Add-Finding 'Defender Process Exclusion' 'Process excluded from Defender scanning' $x 'High'; $ex++ } }
+        foreach ($x in @($pref.ExclusionExtension)) { if ($x) { Add-Finding 'Defender Extension Exclusion' "Extension '$x' excluded from Defender scanning" 'Windows Defender exclusion list' 'Medium'; $ex++ } }
+        if ($ex -eq 0) { Add-Pass 'No Defender exclusions' }
+    } catch {
+        Add-Finding 'Defender Unavailable' 'Could not query Windows Defender (disabled, removed, or replaced by another AV)' 'Get-MpComputerStatus' 'Info'
+    }
+}
+
+# =====================================================================
+#  TIER 3 - VBS / DMA
+# =====================================================================
+function Invoke-VbsScan {
+    $dg = Get-CimInstance -Namespace 'root\Microsoft\Windows\DeviceGuard' -ClassName Win32_DeviceGuard -ErrorAction SilentlyContinue
+    $dgPath = 'root\Microsoft\Windows\DeviceGuard'
+    if (-not $dg) { Add-Finding 'VBS Unknown' 'Device Guard / VBS status could not be read' $dgPath 'Info'; return }
+    if ($dg.VirtualizationBasedSecurityStatus -eq 2) { Add-Pass 'Virtualization-based Security RUNNING' }
+    else { Add-Finding 'VBS / Core Isolation' "Virtualization-based Security is NOT running (status $($dg.VirtualizationBasedSecurityStatus))" $dgPath 'Medium' }
+    $hvci = @($dg.SecurityServicesRunning) -contains 2
+    if ($hvci) { Add-Pass 'Memory Integrity (HVCI) ENABLED' }
+    else { Add-Finding 'Memory Integrity OFF' 'Memory Integrity (HVCI / Core Isolation) is not running - kernel-level cheats can load more easily' 'HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity' 'Medium' }
+}
+
+function Invoke-DmaScan {
+    $hits = 0
+    foreach ($d in (Get-CimInstance Win32_PnPEntity -ErrorAction SilentlyContinue)) {
+        $blob = "$($d.Name) $($d.Manufacturer) $($d.Description) $($d.DeviceID) $(@($d.HardwareID) -join ' ')"
+        if ($blob -match $DmaRx) {
+            Add-Finding 'Suspicious DMA / FPGA Device' "$($d.Name) ($($d.Manufacturer)) matches a DMA/FPGA cheat-hardware signature" ([string]$d.DeviceID) 'High'; $hits++
+        }
+    }
+    if ($hits -eq 0) { Add-Pass 'No DMA / FPGA hardware signatures found' }
+}
+
+# =====================================================================
+#  DISCORD ALT-ACCOUNT DETECTOR (local client data, no tokens are read)
+# =====================================================================
+function Read-SharedText([string]$Path) {
+    try {
+        $fs = [IO.File]::Open($Path, 'Open', 'Read', 'ReadWrite')
+        try {
+            if ($fs.Length -gt 40MB) { return '' }
+            $buf = New-Object byte[] $fs.Length
+            [void]$fs.Read($buf, 0, $buf.Length)
+            return [Text.Encoding]::GetEncoding(28591).GetString($buf)
+        } finally { $fs.Dispose() }
+    } catch { return '' }
+}
+
+function Invoke-DiscordScan {
+    param([string]$SuspectId)
+    $acc = @{}
+    $rxCache  = [regex]'user_id_cache[^0-9]{0,24}(\d{17,20})'
+    $rxUser   = [regex]'\\?"id\\?"\s*:\s*\\?"(\d{17,20})\\?"\s*,\s*\\?"username\\?"\s*:\s*\\?"([^"\\]{2,32})'
+    $rxSentry = [regex]'"user"\s*:\s*\{[^}]*?"id"\s*:\s*"(\d{17,20})"'
+    $clients  = @('discord', 'discordptb', 'discordcanary', 'discorddevelopment', 'Lightcord', 'vesktop', 'vesktop\sessionData', 'legcord', 'ArmCord')
+
+    $add = {
+        param($id, $name, $client, $prof, $file)
+        if (-not $acc.ContainsKey($id)) {
+            $acc[$id] = [pscustomobject]@{ Id = $id; Name = ''; Client = $client; Profile = $prof; Path = $file }
+        }
+        if ($name -and -not $acc[$id].Name) { $acc[$id].Name = $name }
+    }
+
+    foreach ($u in (Get-ChildItem "$env:SystemDrive\Users" -Directory -Force | Where-Object { $_.Name -notin 'Public', 'Default', 'Default User', 'All Users' })) {
+        $roam = Join-Path $u.FullName 'AppData\Roaming'
+        foreach ($c in $clients) {
+            $base = Join-Path $roam $c
+            if (-not (Test-Path -LiteralPath $base)) { continue }
+            $files = @()
+            $ldb = Join-Path $base 'Local Storage\leveldb'
+            if (Test-Path -LiteralPath $ldb) { $files += @(Get-ChildItem "$ldb\*" -Include '*.ldb', '*.log' -File -Force) }
+            $sent = Join-Path $base 'sentry\scope_v3.json'
+            if (Test-Path -LiteralPath $sent) { $files += @(Get-Item -LiteralPath $sent -Force) }
+            foreach ($f in $files) {
+                $text = Read-SharedText $f.FullName
+                if (-not $text) { continue }
+                foreach ($m in $rxCache.Matches($text))  { & $add $m.Groups[1].Value '' $c $u.Name $f.FullName }
+                foreach ($m in $rxUser.Matches($text))   { & $add $m.Groups[1].Value $m.Groups[2].Value $c $u.Name $f.FullName }
+                foreach ($m in $rxSentry.Matches($text)) { & $add $m.Groups[1].Value '' $c $u.Name $f.FullName }
+            }
+        }
+    }
+    $Script:DiscordAccounts = @($acc.Values)
+
+    $Script:WinAccounts = @(Get-CimInstance Win32_UserProfile -ErrorAction SilentlyContinue | Where-Object { -not $_.Special -and $_.LocalPath } | ForEach-Object {
+        $n = Split-Path $_.LocalPath -Leaf
+        if ($_.LastUseTime) { "$n (last used $($_.LastUseTime.ToString('yyyy-MM-dd')))" } else { $n }
+    })
+
+    foreach ($a in $Script:DiscordAccounts) {
+        if ($SuspectId -and $a.Id -ne $SuspectId) {
+            $nm = if ($a.Name) { "$($a.Name) " } else { '' }
+            Add-Finding 'Discord Alt Account' "Additional Discord account ${nm}($($a.Id)) found on this device via $($a.Client) / Windows user $($a.Profile)" $a.Path 'Medium'
+        }
+    }
+    if ($SuspectId -and $Script:DiscordAccounts.Count -gt 0 -and -not ($Script:DiscordAccounts | Where-Object { $_.Id -eq $SuspectId })) {
+        Add-Finding 'Discord ID Mismatch' "Suspect ID $SuspectId was NOT found in any local Discord client data (different or alt account in use?)" 'Local Discord client storage' 'Medium'
+    }
+    if ($Script:DiscordAccounts.Count -eq 0) { Add-Pass 'No Discord client data found on this device' }
+    elseif ($Script:DiscordAccounts.Count -eq 1 -and $SuspectId -and $Script:DiscordAccounts[0].Id -eq $SuspectId) { Add-Pass 'Only the suspect Discord account found on this device' }
+}
+
+# =====================================================================
+#  DISCORD WEBHOOK DELIVERY
+# =====================================================================
+try {
+    $tls = [int][Net.SecurityProtocolType]::Tls12
+    $tls = $tls -bor 12288    # TLS 1.3 where the OS supports it
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]$tls
+} catch {
+    try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+}
+
+function Send-DiscordPayload {
+    param([hashtable]$Payload)
+    $json  = $Payload | ConvertTo-Json -Depth 12 -Compress
+    $bytes = [Text.Encoding]::UTF8.GetBytes($json)
+    for ($try = 1; $try -le 3; $try++) {
+        try {
+            Invoke-RestMethod -Uri $WebhookUrl -Method Post -ContentType 'application/json; charset=utf-8' -Body $bytes -UserAgent $UserAgent -TimeoutSec 20 -ErrorAction Stop | Out-Null
+            return $true
+        } catch {
+            $code = 0; try { $code = [int]$_.Exception.Response.StatusCode } catch {}
+            if ($code -eq 429) { Start-Sleep -Seconds 3; continue }
+            try {
+                $req = [Net.HttpWebRequest]::Create($WebhookUrl)
+                $req.Method = 'POST'; $req.ContentType = 'application/json; charset=utf-8'
+                $req.UserAgent = $UserAgent; $req.Timeout = 20000; $req.ContentLength = $bytes.Length
+                $rs = $req.GetRequestStream(); $rs.Write($bytes, 0, $bytes.Length); $rs.Close()
+                $resp = $req.GetResponse(); $resp.Close()
+                return $true
+            } catch {
+                $c2 = 0; try { $c2 = [int]$_.Exception.Response.StatusCode } catch {}
+                if ($c2 -eq 429) { Start-Sleep -Seconds 3 } else { Start-Sleep -Seconds 2 }
+            }
+        }
     }
     return $false
 }
 
-function Add-Finding {
-    param([string]$Category, [string]$Details, [string]$PathInfo)
-    [void]$global:Findings.Add([PSCustomObject]@{ Category = $Category; Details = $Details; Path = $PathInfo })
+function Esc-Md([string]$s) { if ($null -eq $s) { return '' }; return ($s -replace '([\\*_~`|>])', '\$1') }
+function Cut([string]$s, [int]$max) { if ($s.Length -gt $max) { return $s.Substring(0, $max - 3) + '...' } else { return $s } }
+function New-UserBlock([string]$id) {
+    if ($id) { return "<@$id>`n[$(($ProfileBase -replace '^https?://', ''))$id]($ProfileBase$id)" }
+    return '`Not provided`'
 }
 
-$global:NativeOk = $false
-try {
-    Add-Type -TypeDefinition @'
-using System;
-using System.Text;
-using System.Runtime.InteropServices;
-public static class RecNative {
-    [DllImport("kernel32.dll", SetLastError=true)]
-    public static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
-    [DllImport("kernel32.dll", SetLastError=true)]
-    public static extern bool CloseHandle(IntPtr h);
-    [DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
-    public static extern bool QueryFullProcessImageName(IntPtr h, uint flags, StringBuilder sb, ref uint size);
-    public static string ImagePath(int pid) {
-        IntPtr h = OpenProcess(0x1000, false, pid);
-        if (h == IntPtr.Zero) return null;
-        try {
-            StringBuilder sb = new StringBuilder(2048);
-            uint size = 2048;
-            if (QueryFullProcessImageName(h, 0, sb, ref size)) return sb.ToString();
-            return null;
-        } finally { CloseHandle(h); }
+function Send-Report {
+    param([string]$TierName, [string]$SuspectId, [string]$ModId, [TimeSpan]$Elapsed)
+    $sorted = @($Script:Findings | Sort-Object @{ e = { switch ($_.Severity) { 'High' { 0 } 'Medium' { 1 } default { 2 } } } }, Category)
+    $high = @($sorted | Where-Object { $_.Severity -eq 'High' }).Count
+    $med  = @($sorted | Where-Object { $_.Severity -eq 'Medium' }).Count
+    $info = @($sorted | Where-Object { $_.Severity -eq 'Info' }).Count
+
+    if ($high -gt 0)     { $color = 15548997; $head = '### :rotating_light:  SUSPICIOUS ACTIVITY DETECTED'; $verdict = 'FLAGGED' }
+    elseif ($med -gt 0)  { $color = 16705372; $head = '### :warning:  REVIEW NEEDED';                       $verdict = 'REVIEW' }
+    else                 { $color = 5763719;  $head = '### :white_check_mark:  NO DETECTIONS';              $verdict = 'CLEAN' }
+
+    $ts   = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.000Z')
+    $unix = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    $passed = if ($Script:Passed.Count) { '```diff' + "`n" + (($Script:Passed | ForEach-Object { "+ $_" }) -join "`n") + "`n" + '```' } else { '`none`' }
+
+    $fields = @(
+        @{ name = ':dart: Suspect';   value = (New-UserBlock $SuspectId); inline = $true },
+        @{ name = ':shield: Moderator'; value = (New-UserBlock $ModId);   inline = $true },
+        @{ name = ':bar_chart: Verdict'; value = "``$verdict``  |  :red_circle: $high  :yellow_circle: $med  :white_circle: $info"; inline = $true },
+        @{ name = ':gear: Scan Tier'; value = "``$TierName``"; inline = $true },
+        @{ name = ':computer: Machine'; value = "``$env:COMPUTERNAME`` / ``$env:USERNAME``"; inline = $true },
+        @{ name = ':stopwatch: Completed'; value = "<t:${unix}:R>  (took $([int]$Elapsed.TotalSeconds)s)"; inline = $true },
+        @{ name = ':white_check_mark: Passed Checks'; value = (Cut $passed 1000); inline = $false }
+    )
+    $headerEmbed = @{
+        title = 'COMPETITIVE ANTI-EXPLOIT  |  SCAN REPORT'
+        description = "$head`n$($Script:Findings.Count) finding(s) recorded on **$env:COMPUTERNAME**"
+        color = $color; fields = $fields; timestamp = $ts
+        footer = @{ text = "$ToolName v3.0  |  Windows $([Environment]::OSVersion.Version)" }
+    }
+    $ok = Send-DiscordPayload @{ username = $ToolName; allowed_mentions = @{ parse = @() }; embeds = @($headerEmbed) }
+    if (-not $ok) { return $false }
+    Start-Sleep -Milliseconds 700
+
+    # Discord accounts embed
+    $accLines = New-Object System.Collections.Generic.List[string]
+    foreach ($a in ($Script:DiscordAccounts | Select-Object -First 25)) {
+        $flag = if (-not $SuspectId) { ':grey_question:' } elseif ($a.Id -eq $SuspectId) { ':green_circle: suspect' } else { ':orange_circle: alt candidate' }
+        $nm = if ($a.Name) { Esc-Md $a.Name } else { 'unknown name' }
+        $accLines.Add("$flag  **$nm**  <@$($a.Id)>  [profile]($ProfileBase$($a.Id))`n*Client:* $($a.Client)  |  *Windows user:* $(Esc-Md $a.Profile)")
+    }
+    $accDesc = if ($accLines.Count) { ($accLines -join "`n`n") } else { 'No Discord accounts were found in local client data.' }
+    $winDesc = if ($Script:WinAccounts.Count) { (($Script:WinAccounts | Select-Object -First 15 | ForEach-Object { '`' + $_ + '`' }) -join '  ') } else { '`none`' }
+    $accEmbed = @{
+        title = ':busts_in_silhouette:  DISCORD ACCOUNT / ALT DETECTOR'
+        description = (Cut $accDesc 3600)
+        color = 5793266
+        fields = @(@{ name = ':desktop: Windows accounts on this device'; value = (Cut $winDesc 1000); inline = $false })
+        footer = @{ text = 'Best-effort: reads IDs cached by installed Discord clients. No tokens are read.' }
+    }
+    [void](Send-DiscordPayload @{ username = $ToolName; allowed_mentions = @{ parse = @() }; embeds = @($accEmbed) })
+    Start-Sleep -Milliseconds 700
+
+    # Detection embeds
+    if ($sorted.Count -eq 0) { return $true }
+    $chunks = New-Object System.Collections.Generic.List[object]
+    $cur = New-Object System.Text.StringBuilder; $curSev = 'Info'
+    $rank = @{ High = 0; Medium = 1; Info = 2 }
+    foreach ($f in $sorted) {
+        $entry = '**[' + (Esc-Md $f.Category) + ']** ' + (Esc-Md (Cut $f.Details 300)) + "`n" + '*Path:* ' + (Esc-Md (Cut $f.Path 350))
+        if ($cur.Length + $entry.Length + 2 -gt 3700) {
+            $chunks.Add(@{ Text = $cur.ToString(); Sev = $curSev }); $cur = New-Object System.Text.StringBuilder; $curSev = 'Info'
+        }
+        if ($cur.Length -gt 0) { [void]$cur.Append("`n`n") }
+        [void]$cur.Append($entry)
+        if ($rank[$f.Severity] -lt $rank[$curSev]) { $curSev = $f.Severity }
+    }
+    if ($cur.Length -gt 0) { $chunks.Add(@{ Text = $cur.ToString(); Sev = $curSev }) }
+
+    $total = [math]::Min($chunks.Count, 10); $i = 0
+    foreach ($ch in ($chunks | Select-Object -First 10)) {
+        $i++
+        $col = switch ($ch.Sev) { 'High' { 15548997 } 'Medium' { 16705372 } default { 9807270 } }
+        $desc = $ch.Text
+        if ($i -eq $total -and $chunks.Count -gt 10) { $desc += "`n`n*...additional detections truncated (Discord limit).*" }
+        $emb = @{ title = "DETECTIONS  |  Part $i of $total"; description = $desc; color = $col; footer = @{ text = "$ToolName  |  Suspect: $(if ($SuspectId) { $SuspectId } else { 'n/a' })  |  Mod: $(if ($ModId) { $ModId } else { 'n/a' })" } }
+        [void](Send-DiscordPayload @{ username = $ToolName; allowed_mentions = @{ parse = @() }; embeds = @($emb) })
+        Start-Sleep -Milliseconds 700
+    }
+    return $true
+}
+
+# =====================================================================
+#  SPONGEBOB TERMINAL
+# =====================================================================
+$SpongeArt = @'
+
+            .-"""""""""""""""""-.
+           /  .-.           .-.  \
+          |  ( O )         ( O )  |
+          |   '-'    ___    '-'   |
+          |    \    /   \    /    |
+          |     \__/_____\__/     |
+          |      \  \___/  /      |
+          |  [][]  '-----'  [][]  |
+           \_____________________/
+            ||||  /|     |\  ||||
+            ||||   |  _  |   ||||
+          __||||___|_| |_|___||||__
+         |  S P O N G E B O B  :)  |
+         '---------------------------'
+'@
+
+function Show-SpongeBob([int]$Detections) {
+    Write-Host $SpongeArt -ForegroundColor Yellow
+    $pr = 'SpongeBob@krusty-krab:~$ '
+    Write-Typed ($pr + './krabby-patty-scan --formula-safe --plankton-check') 'Green' 14
+    Start-Sleep -Milliseconds 300
+    Write-Typed '  [..] Checking the secret formula vault.................. SAFE'  'DarkYellow' 6
+    Write-Typed '  [..] Sweeping the Chum Bucket for sneaky Plankton........ DONE'  'DarkYellow' 6
+    Write-Typed '  [..] Asking Squidward if anything looks suspicious....... "NO."' 'DarkYellow' 6
+    if ($Detections -gt 0) {
+        Write-Typed "  [!!] $Detections suspicious thing(s) found - Plankton is up to something!" 'Red' 8
+        Write-Typed '  [OK] Report delivered to the moderators. Case closed, Mr. Krabs!' 'Yellow' 8
+    } else {
+        Write-Typed '  [OK] No Plankton in sight. One clean Krabby Patty, coming up!' 'Yellow' 8
+    }
+    Write-Host ''
+    Write-Typed ($pr + 'echo "I''M READY!"') 'Green' 14
+    Write-Typed 'I''M READY!  I''M READY!  I''M READY!' 'Yellow' 25
+    Write-Host ''
+}
+
+# =====================================================================
+#  MAIN
+# =====================================================================
+Show-Banner
+Write-Host '  fuck cheaters and detect them' -ForegroundColor Red
+Write-Host ''
+Write-Host '  This tool scans this PC and sends the results to the moderation team.' -ForegroundColor DarkGray
+$consent = (Read-Host '  Does the owner of this PC consent to this scan? (Y/N)').Trim()
+if ($consent -notmatch '^(y|yes)$') { Write-Host '  Scan cancelled.' -ForegroundColor DarkYellow; Start-Sleep 2; exit }
+Write-Host ''
+
+Show-Menu
+$tier = 0
+while ($tier -lt 1 -or $tier -gt 3) {
+    $t = (Read-Host '  Choose tier (1-3)').Trim()
+    if ($t -match '^[1-3]$') { $tier = [int]$t } else { Write-Host '    Enter 1, 2 or 3.' -ForegroundColor DarkYellow }
+}
+Write-Host ''
+$SuspectId = Read-DiscordId '  Discord ID of the SUSPECT being checked (ENTER to skip)'
+$ModId     = Read-DiscordId '  Discord ID of the MODERATOR running the test (ENTER to skip)'
+$TierName  = @('', 'Tier 1 - Standard', 'Tier 2 - Deep', 'Tier 3 - Full Forensic')[$tier]
+Write-Host ''
+Write-Host "  >> $TierName armed. Starting scan..." -ForegroundColor Cyan
+Write-Host ''
+
+$steps = @(
+    @{ N = 'Processes + renamed executables';     T = 1; A = { Invoke-ProcessScan } },
+    @{ N = 'Roblox module injection check';       T = 1; A = { Invoke-RobloxModuleScan } },
+    @{ N = 'Cheat files on disk';                 T = 1; A = { Invoke-DiskScan } },
+    @{ N = 'Discord account / alt detector';      T = 1; A = { Invoke-DiscordScan -SuspectId $SuspectId } },
+    @{ N = 'Prefetch execution traces';           T = 2; A = { Invoke-PrefetchScan } },
+    @{ N = 'Defender status + exclusions';        T = 2; A = { Invoke-DefenderScan } },
+    @{ N = 'Memory Integrity / VBS';              T = 3; A = { Invoke-VbsScan } },
+    @{ N = 'DMA / FPGA hardware';                 T = 3; A = { Invoke-DmaScan } }
+)
+$active = @($steps | Where-Object { $_.T -le $tier })
+$sw = [Diagnostics.Stopwatch]::StartNew()
+$n = 0
+foreach ($s in $active) {
+    $n++
+    $before = $Script:Findings.Count
+    Show-Step $n $active.Count $s.N
+    try { & $s.A } catch {}
+    $delta = $Script:Findings.Count - $before
+    if ($delta -gt 0) { Write-Host "  -> +$delta" -ForegroundColor Red } else { Write-Host '  -> ok' -ForegroundColor Green }
+}
+$sw.Stop()
+
+Write-Host ''
+Write-Host '  ==================== RESULTS ====================' -ForegroundColor Cyan
+if ($Script:Findings.Count -eq 0) {
+    Write-Host '  No detections.' -ForegroundColor Green
+} else {
+    foreach ($f in ($Script:Findings | Sort-Object @{ e = { switch ($_.Severity) { 'High' { 0 } 'Medium' { 1 } default { 2 } } } }, Category)) {
+        $c = switch ($f.Severity) { 'High' { 'Red' } 'Medium' { 'Yellow' } default { 'DarkGray' } }
+        Write-Host ("  [{0}] " -f $f.Category) -ForegroundColor $c -NoNewline
+        Write-Host $f.Details -ForegroundColor White
+        Write-Host ("      Path: {0}" -f $f.Path) -ForegroundColor DarkGray
     }
 }
-'@ -ErrorAction Stop
-    $global:NativeOk = $true
-} catch {}
+foreach ($p in $Script:Passed) { Write-Host "  [+] $p" -ForegroundColor DarkGreen }
+Write-Host ''
 
-function Get-SecureImagePath {
-    param([int]$ProcessId)
-    if (-not $global:NativeOk -or $ProcessId -le 0) { return $null }
-    try { return [RecNative]::ImagePath($ProcessId) } catch { return $null }
-}
-
-function Run-Scans {
-    try {
-        foreach ($proc in (Get-Process -ErrorAction SilentlyContinue)) {
-            $path = Get-SecureImagePath -ProcessId $proc.Id
-            if (Test-TrustedPath -Path $path) { continue }
-            if ($proc.Name -match $global:TargetSignatures) {
-                Add-Finding "Process" "$($proc.Name)" "$path"
-            }
-        }
-
-        foreach ($py in (Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '(?i)^(python|pythonw|py)$' })) {
-            $path = Get-SecureImagePath -ProcessId $py.Id
-            $cmdLine = (Get-CimInstance Win32_Process -Filter "ProcessId = $($py.Id)" -ErrorAction SilentlyContinue).CommandLine
-            if ($cmdLine -and $cmdLine -match $global:CheatKeywords) {
-                Add-Finding "Colorbot/Script" "Python Script Execution" "$path"
-            }
-        }
-
-        foreach ($user in (Get-ChildItem -Path "$env:SystemDrive\Users" -Directory -ErrorAction SilentlyContinue)) {
-            $paths = @(
-                "$($user.FullName)\AppData\Local\Google\Chrome\User Data\Default\History",
-                "$($user.FullName)\AppData\Local\Microsoft\Edge\User Data\Default\History",
-                "$($user.FullName)\AppData\Local\BraveSoftware\Brave-Browser\User Data\Default\History"
-            )
-            foreach ($histPath in $paths) {
-                if (Test-Path $histPath) {
-                    try {
-                        $tempCopy = "$env:TEMP\h_$(Get-Random).db"
-                        Copy-Item -LiteralPath $histPath -Destination $tempCopy -Force -ErrorAction SilentlyContinue
-                        if (Test-Path $tempCopy) {
-                            $text = [System.Text.Encoding]::UTF8.GetString([System.IO.File]::ReadAllBytes($tempCopy))
-                            Remove-Item -LiteralPath $tempCopy -Force -ErrorAction SilentlyContinue
-                            if ($text -match $global:CheatKeywords) {
-                                Add-Finding "Browser Forensics" "Cheat History Match Found" "$histPath"
-                            }
-                        }
-                    } catch {}
-                }
-            }
-        }
-
-        $sac = (Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\SmartAppControl" -Name "Enabled" -ErrorAction SilentlyContinue).Enabled
-        if ($null -eq $sac -or $sac -eq 0) {
-            Add-Finding "Security" "Smart App Control Disabled/Inactive" "HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\SmartAppControl"
-        }
-
-        $pref = Get-MpPreference -ErrorAction SilentlyContinue
-        if ($pref) {
-            if ($pref.DisableRealtimeMonitoring -eq $true) { Add-Finding "Defender" "Real-time protection disabled" "Windows Defender Preferences" }
-            if ($pref.DisableBehaviorMonitoring -eq $true) { Add-Finding "Defender" "Behavior monitoring disabled" "Windows Defender Preferences" }
-            if ($pref.ExclusionPath -and $pref.ExclusionPath.Count -gt 0) { Add-Finding "Defender" "Path exclusions active" "Windows Defender Preferences" }
-        }
-
-        $prefetchDir = "$env:SystemRoot\Prefetch"
-        if (Test-Path $prefetchDir) {
-            foreach ($pf in (Get-ChildItem -Path $prefetchDir -Filter "*.pf" -ErrorAction SilentlyContinue)) {
-                if ($pf.Name.ToLower() -match $global:TargetSignatures -or $pf.Name.ToLower() -match $global:CheatKeywords) {
-                    Add-Finding "Prefetch" "$($pf.Name)" "$prefetchDir\$($pf.Name)"
-                }
-            }
-        }
-
-        foreach ($drv in (Get-CimInstance Win32_SystemDriver -ErrorAction SilentlyContinue | Where-Object { $_.State -eq 'Running' })) {
-            if ($drv.PathName) {
-                $cleanPath = $drv.PathName -replace '^\??\\', ''
-                if ($cleanPath -match '^system32\\drivers\\') { $cleanPath = "$env:SystemRoot\$cleanPath" }
-                if ($cleanPath -match $global:TargetSignatures -or (-not (Test-Path -LiteralPath $cleanPath) -and $drv.Name -match $global:CheatKeywords)) {
-                    Add-Finding "Kernel Driver" "$($drv.Name)" "$cleanPath"
-                }
-            }
-        }
-
-        foreach ($dev in (Get-PnpDevice -ErrorAction SilentlyContinue)) {
-            $hwId = "$($dev.HardwareID)"
-            $name = "$($dev.Name)"
-            if ($hwId -match 'VEN_10EE' -or $hwId -match 'VEN_1172' -or $name -match '(?i)(fpga|xilinx|screamer|leetdma|squirrel|dma)') {
-                Add-Finding "Hardware" "Suspicious DMA/FPGA: $name" "Device Manager PnP"
-            }
-        }
-
-        foreach ($bb in (Get-CimInstance Win32_BaseBoard -ErrorAction SilentlyContinue)) {
-            $sn = "$($bb.SerialNumber)".Trim()
-            if ($sn -match '(?i)^(to be filled|default|oem|none|0+|-|system serial|unknown|1234567890)$' -or $sn.Length -lt 3) {
-                Add-Finding "HWID Spoofer" "Motherboard serial spoofed/blank" "Win32_BaseBoard"
-            }
-        }
-    } catch {}
-}
-
-Run-Scans
-
-if ($global:WebhookUrl) {
-    try {
-        $desc = if ($global:Findings.Count -eq 0) { "No cheats, unauthorized tools, or tampering detected." } else {
-            ($global:Findings | ForEach-Object { "**[$($_.Category)]** $($_.Details)`n`*Path:* ``$($_.Path)``" }) -join "`n`n"
-        }
-        if ($desc.Length -gt 4000) { $desc = $desc.Substring(0, 3996) + "..." }
-
-        $payload = @{
-            username = "Roblox Anti-Cheat Sentinel"
-            embeds = @(
-                @{
-                    title       = "Diagnostic & Cheat Detection Report"
-                    description = $desc
-                    color       = if ($global:Findings.Count -gt 0) { 15158332 } else { 3066993 }
-                    timestamp   = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ssZ")
-                }
-            )
-        } | ConvertTo-Json -Depth 10
-
-        Invoke-RestMethod -Uri $global:WebhookUrl -Method Post -Body $payload -ContentType 'application/json' -ErrorAction SilentlyContinue
-    } catch {}
-}
-
-Write-Host "hope lil bro got detected" -ForegroundColor Green
+Write-Host '  Sending report to Discord...' -ForegroundColor Cyan -NoNewline
+$sent = Send-Report -TierName $TierName -SuspectId $SuspectId -ModId $ModId -Elapsed $sw.Elapsed
+if ($sent) { Write-Host '  delivered.' -ForegroundColor Green } else { Write-Host '  FAILED (check internet / webhook).' -ForegroundColor Red }
+Write-Host ''
+Write-Host '  hope lil bro got detected' -ForegroundColor Green
+Show-SpongeBob -Detections $Script:Findings.Count
+Read-Host '  Press ENTER to exit' | Out-Null
